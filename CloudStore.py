@@ -119,6 +119,12 @@ class CloudStorage:
                 conn.execute("ALTER TABLE files ADD COLUMN file_data BLOB")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+            
+            # Add index for search performance on local_name column
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_files_local_name ON files(local_name)")
+            except sqlite3.OperationalError:
+                pass  # Index might already exist
 
     def _get_file_hash(self, file_path: str) -> str:
         """Generate MD5 hash of file for integrity checking"""
@@ -282,13 +288,21 @@ class CloudStorage:
             print(f"Failed to list cloud files: {e}")
             return []
 
-    def get_local_files(self) -> list:
-        """Get list of files from local database"""
+    def get_local_files(self, search_term: str = None) -> list:
+        """Get list of files from local database with optional search filtering"""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM files ORDER BY upload_date DESC"
-            ).fetchall()
+            if search_term and search_term.strip():
+                # Use SQL LIKE for efficient database-level filtering
+                search_pattern = f"%{search_term.strip()}%"
+                rows = conn.execute(
+                    "SELECT * FROM files WHERE local_name LIKE ? ORDER BY upload_date DESC",
+                    (search_pattern,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM files ORDER BY upload_date DESC"
+                ).fetchall()
         return rows
 
     def remove_local_file(self, file_id: int) -> None:
@@ -315,9 +329,11 @@ class CloudFileApp:
         self._configure_style()
         
         # State variables
-
         self.search_var = StringVar(value="")
         self.status_var = StringVar(value="")
+        
+        # Search debouncing
+        self._search_job = None
         
         # Build UI
         self._build_layout()
@@ -657,8 +673,17 @@ class CloudFileApp:
 
     def _bind_events(self) -> None:
         self.tree.bind("<<TreeviewSelect>>", self._on_file_select)
-        self.search_var.trace_add("write", lambda *_: self.refresh_files())
+        self.search_var.trace_add("write", self._debounced_search)
         self.root.bind("<Return>", lambda event: self.upload_file())
+
+    def _debounced_search(self, *args) -> None:
+        """Debounced search to prevent excessive database queries"""
+        # Cancel previous search if user is still typing
+        if self._search_job is not None:
+            self.root.after_cancel(self._search_job)
+        
+        # Wait 300ms after user stops typing before searching
+        self._search_job = self.root.after(300, self.refresh_files)
 
     def _on_file_select(self, event=None) -> None:
         selection = self.tree.selection()
@@ -679,18 +704,19 @@ class CloudFileApp:
         return f"{size_bytes:.1f} {size_names[i]}"
 
     def refresh_files(self) -> None:
+        """Refresh the file list with optimized search and UI updates"""
+        # Clear existing items
         for item in self.tree.get_children():
             self.tree.delete(item)
         
         try:
-            files = self.storage.get_local_files()
-            search_term = self.search_var.get().lower()
+            # Get search term and pass it to database query for efficient filtering
+            search_term = self.search_var.get().strip()
+            files = self.storage.get_local_files(search_term)
             displayed_count = 0
             
+            # Process files (already filtered by database)
             for file in files:
-                if search_term and search_term not in file['local_name'].lower():
-                    continue
-                
                 status = "Synced" if file['is_synced'] else "Local Only"
                 size_str = self._format_size(file['file_size'] or 0)
                 mime_type = file['file_mime'] or "Unknown"
@@ -706,7 +732,8 @@ class CloudFileApp:
             
             # Update file count display
             if hasattr(self, 'file_count_label'):
-                self.file_count_label.configure(text=f"{displayed_count} files")
+                search_indicator = f" (filtered)" if search_term else ""
+                self.file_count_label.configure(text=f"{displayed_count} files{search_indicator}")
                 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load files: {e}")
